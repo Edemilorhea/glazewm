@@ -33,6 +33,9 @@ pub fn move_workspace_in_direction(
       target_monitor.child_count(),
       state,
     )?;
+    state
+      .pending_workspace_restores
+      .retain(|pending| pending.workspace_id != workspace.id());
 
     let windows = workspace
       .descendants()

@@ -27,7 +27,20 @@ use crate::{
   user_config::UserConfig,
 };
 
+/// Workspace moved off a disconnected monitor, to be moved back once the
+/// same physical monitor reconnects.
+#[derive(Clone)]
+pub struct PendingWorkspaceRestore {
+  pub workspace_id: Uuid,
+  pub origin_monitor_id: Uuid,
+  pub target_monitor_id: Uuid,
+  pub origin_properties: NativeMonitorProperties,
+  /// Floating placements of the workspace's windows before the move.
+  pub floating_placements: Vec<(Uuid, Rect)>,
+}
+
 pub struct WmState {
+  pub pending_workspace_restores: Vec<PendingWorkspaceRestore>,
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
   pub root_container: RootContainer,
@@ -85,6 +98,7 @@ impl WmState {
   ) -> Self {
     Self {
       root_container: RootContainer::new(),
+      pending_workspace_restores: Vec::new(),
       dispatcher,
       pending_sync: PendingSync::default(),
       prev_effects_window: None,

@@ -3,13 +3,14 @@ use wm_common::try_warn;
 
 use crate::{
   commands::monitor::{
-    add_monitor, move_bounded_workspaces_to_new_monitor, remove_monitor,
-    sort_monitors, update_monitor,
+    add_monitor, move_bounded_workspaces_to_new_monitor,
+    move_workspace_to_monitor, remove_monitor, sort_monitors,
+    update_monitor,
   },
-  models::{Monitor, NativeMonitorProperties},
+  models::{Monitor, NativeMonitorProperties, Workspace},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{PendingWorkspaceRestore, WmState},
 };
 
 pub fn handle_display_settings_changed(
@@ -35,6 +36,10 @@ pub fn handle_display_settings_changed(
     }));
 
   let mut pending_monitors = state.monitors();
+  let remembered_properties = pending_monitors
+    .iter()
+    .map(|monitor| (monitor.id(), monitor.native_properties()))
+    .collect::<Vec<_>>();
   let mut unmatched_displays = Vec::new();
 
   // Match each display to an existing monitor and update it.
@@ -81,6 +86,53 @@ pub fn handle_display_settings_changed(
     move_bounded_workspaces_to_new_monitor(&new_monitor, state, config)?;
   }
 
+  // Restore only workspaces still on their temporary monitor. Match physical
+  // identity rather than monitor index or a potentially recycled handle.
+  let present = state.monitors();
+  let pending = std::mem::take(&mut state.pending_workspace_restores);
+  for record in &pending {
+    let Some(workspace) = state
+      .workspaces()
+      .into_iter()
+      .find(|workspace| workspace.id() == record.workspace_id)
+    else {
+      continue;
+    };
+    let Some(current_monitor) = workspace.monitor() else {
+      continue;
+    };
+    if workspace.config().bind_to_monitor.is_some() {
+      continue;
+    }
+    if current_monitor.id() != record.target_monitor_id {
+      continue;
+    }
+
+    let matching = present
+      .iter()
+      .filter(|monitor| {
+        let properties = monitor.native_properties();
+        matches_origin(
+          &properties,
+          record,
+          &present,
+          &remembered_properties,
+          &pending,
+        )
+      })
+      .collect::<Vec<_>>();
+
+    if matching.len() == 1 {
+      let origin = matching[0];
+      if origin.id() != current_monitor.id() {
+        move_workspace_to_monitor(&workspace, origin, state, config)?;
+        restore_floating_placements(&workspace, record);
+      }
+      continue;
+    }
+    state.pending_workspace_restores.push(record.clone());
+  }
+
   for window in state.windows() {
     // Display setting changes can spread windows out sporadically, so mark
     // all windows as needing a DPI adjustment (just in case).
@@ -120,6 +172,125 @@ pub fn handle_display_settings_changed(
     .queue_container_to_redraw(state.root_container.clone());
 
   Ok(())
+}
+
+/// Reapplies the floating placements saved before the workspace was moved
+/// off its origin monitor.
+///
+/// Placements that no longer intersect the workspace are skipped, so they
+/// stay centered.
+fn restore_floating_placements(
+  workspace: &Workspace,
+  record: &PendingWorkspaceRestore,
+) {
+  let Ok(workspace_rect) = workspace.to_rect() else {
+    return;
+  };
+
+  let windows = workspace
+    .descendants()
+    .filter_map(|descendant| descendant.as_window_container().ok());
+
+  for window in windows {
+    let saved = record
+      .floating_placements
+      .iter()
+      .find(|(id, _)| *id == window.id());
+
+    if let Some((_, placement)) = saved {
+      if placement.intersection_area(&workspace_rect) > 0 {
+        window.set_floating_placement(placement.clone());
+      }
+    }
+  }
+}
+
+/// Returns whether the monitor with the given properties is the physical
+/// origin of the pending restore.
+///
+/// A reassigned monitor's old identity is valid only when its new display
+/// is also the physical origin. Never infers identity from a recycled
+/// monitor ID.
+fn matches_origin(
+  properties: &NativeMonitorProperties,
+  record: &PendingWorkspaceRestore,
+  present: &[Monitor],
+  remembered: &[(uuid::Uuid, NativeMonitorProperties)],
+  pending: &[PendingWorkspaceRestore],
+) -> bool {
+  let origin = &record.origin_properties;
+  #[cfg(target_os = "macos")]
+  {
+    let _ = (present, remembered, pending);
+    !origin.device_uuid.is_empty()
+      && properties.device_uuid == origin.device_uuid
+  }
+  #[cfg(target_os = "windows")]
+  {
+    let path = origin
+      .device_path
+      .as_deref()
+      .filter(|path| !path.is_empty());
+    if let Some(path) = path {
+      let path_matches = present
+        .iter()
+        .filter(|other| {
+          other.native_properties().device_path.as_deref() == Some(path)
+        })
+        .count();
+      if path_matches != 0 {
+        return path_matches == 1
+          && properties.device_path.as_deref() == Some(path)
+          && remembered
+            .iter()
+            .filter(|(_, other)| {
+              other.device_path.as_deref() == Some(path)
+            })
+            .count()
+            <= 1
+          && !pending.iter().any(|other| {
+            other.origin_monitor_id != record.origin_monitor_id
+              && other.origin_properties.device_path.as_deref()
+                == Some(path)
+          });
+      }
+    }
+    let Some(hardware_id) =
+      origin.hardware_id.as_deref().filter(|id| !id.is_empty())
+    else {
+      return false;
+    };
+    properties.hardware_id.as_deref() == Some(hardware_id)
+      && present
+        .iter()
+        .filter(|other| {
+          other.native_properties().hardware_id.as_deref()
+            == Some(hardware_id)
+        })
+        .count()
+        == 1
+      && remembered
+        .iter()
+        .filter(|(_, other)| {
+          other.hardware_id.as_deref() == Some(hardware_id)
+        })
+        .count()
+        <= 1
+      && !remembered.iter().any(|(id, other)| {
+        *id != record.origin_monitor_id
+          && other.hardware_id.as_deref() == Some(hardware_id)
+          && other.device_path != origin.device_path
+      })
+      && pending
+        .iter()
+        .filter(|other| {
+          other.origin_properties.hardware_id.as_deref()
+            == Some(hardware_id)
+            && other.origin_monitor_id != record.origin_monitor_id
+        })
+        .count()
+        == 0
+  }
 }
 
 /// Finds the monitor matching the given display properties.
